@@ -15,138 +15,192 @@
  * 6. 新文件创建后首次编辑会立即更新修改时间，无需等待间隔
  * 7. 采用防循环机制，确保插件的修改操作不会触发新的修改事件
  * 8. 重启Obsidian后不会影响已有文档的时间戳
- *
- * 实现原理：
- * - 使用 isInitializing 标志避免在Obsidian启动时处理文件
- * - 使用 processingFile 标志防止修改操作导致的事件循环
- * - 监听文件打开事件(file-open)，只为当前活动文档添加缺失的时间戳
- * - 监听文件创建事件(create)，同时添加创建时间和初始修改时间
- * - 监听文件修改事件(modify)，根据设定的时间间隔更新修改时间
- * - 文件创建时重置 lastModifiedTime 为 0，确保首次编辑会立即更新修改时间
- * - 使用 frontmatter 格式(YAML)在文档顶部存储时间信息
- * - 精确识别当前活动文件，只处理用户正在操作的文档
+ * 9. 支持多语言，根据Obsidian界面语言自动切换中英文
  */
 
 import {App, Plugin, PluginSettingTab, Setting, TFile, moment} from 'obsidian';
-import {getLocal} from "./i18n/messages";
+import {messages} from "./i18n/i18n";
 
-// 插件设置接口
+/**
+ * 插件设置接口
+ * 定义了用户可配置的所有设置项及其类型
+ * 这些设置会存储在data.json中，并在插件启动时加载
+ */
 interface AutoTimestampsPluginSettings {
-	enableCreatedTime: boolean;    // 是否启用创建时间
-	enableModifiedTime: boolean;   // 是否启用修改时间
-	modifyInterval: number;        // 修改时间的更新间隔（秒）
+	enableCreatedTime: boolean;    // 是否启用创建时间，为true时会为新文档添加创建时间
+	enableModifiedTime: boolean;   // 是否启用修改时间，为true时会在文档修改后更新修改时间
+	modifyInterval: number;        // 修改时间的更新间隔（秒），避免频繁更新导致的性能问题
 }
 
-// 默认设置
+/**
+ * 默认设置
+ * 当用户首次安装插件或settings.json不存在时使用的初始设置
+ */
 const DEFAULT_SETTINGS: AutoTimestampsPluginSettings = {
-	enableCreatedTime: true,
-	enableModifiedTime: true,
-	modifyInterval: 10
+	enableCreatedTime: true,       // 默认启用创建时间
+	enableModifiedTime: true,      // 默认启用修改时间
+	modifyInterval: 10             // 默认10秒更新间隔，避免过于频繁的更新
 }
 
+/**
+ * 自动时间戳插件主类
+ * 实现了插件的所有核心功能
+ */
 export default class AutoTimestampsPlugin extends Plugin {
+	// 插件设置，包含用户的配置选项
 	settings: AutoTimestampsPluginSettings;
+	
+	// 记录上次更新修改时间的时间戳，用于控制更新频率
 	private lastModifiedTime: number = 0;
-	private activeFile: TFile | null = null;  // 追踪当前活动文件
-	private processingFile: boolean = false;  // 防止事件循环的标志
-	private isInitializing: boolean = true;   // 标记插件是否正在初始化
+	
+	// 当前打开的活动文件引用，确保只处理用户正在编辑的文件
+	private activeFile: TFile | null = null;
+	
+	// 标记是否正在处理文件，防止修改操作触发新的modify事件导致无限循环
+	private processingFile: boolean = false;
+	
+	// 标记插件是否正在初始化，避免在Obsidian启动过程中处理文件
+	private isInitializing: boolean = true;
+	
+	// 设置面板实例，用于在语言变化时刷新界面
 	private settingTab: AutoTimestampsSettingTab;
 
+	/**
+	 * 插件加载函数
+	 * 当Obsidian加载插件时调用，用于初始化插件功能和注册事件监听器
+	 */
 	async onload() {
-		// 加载插件设置
+		// 加载用户设置，如果没有保存的设置则使用默认值
 		await this.loadSettings();
 
-		// 添加设置选项卡
+		// 创建设置面板，供用户配置插件选项
 		this.settingTab = new AutoTimestampsSettingTab(this.app, this);
 		this.addSettingTab(this.settingTab);
 
-		// 更新插件描述
+		// 根据当前语言设置更新插件在插件列表中的描述
 		this.updatePluginDescription();
 
-		// 监听Obsidian的本地化变化
+		// 等待Obsidian布局加载完成后注册事件监听器
 		this.app.workspace.onLayoutReady(() => {
+			// 监听Obsidian语言设置变化，在语言切换时刷新UI
 			this.registerEvent(
 				(this.app.workspace as any).on('change:locale', () => {
+					// 当Obsidian语言变化时刷新设置面板和插件描述
 					this.refreshSettingsPane();
 					this.updatePluginDescription();
 				})
 			);
 		});
 
-		// 初始化阶段不处理任何文件
+		// 延迟初始化完成标记，让Obsidian有足够时间完全加载
 		setTimeout(() => {
 			this.isInitializing = false;
-		}, 2000); // 给2秒时间让Obsidian完成启动
+		}, 2000); // 2秒延迟，避免在Obsidian启动时处理文件
 
-		// 注册事件监听器
+		// 注册文件打开事件监听器，处理已存在文件的时间戳
 		this.registerEvent(
 			this.app.workspace.on('file-open', this.handleFileOpen.bind(this))
 		);
 
+		// 注册文件创建事件监听器，为新建文件添加初始时间戳
 		this.registerEvent(
 			this.app.vault.on('create', this.handleFileCreate.bind(this))
 		);
 
+		// 注册文件修改事件监听器，更新文件的修改时间
 		this.registerEvent(
 			this.app.vault.on('modify', this.handleFileModify.bind(this))
 		);
 	}
 
-	// 刷新设置面板
+	/**
+	 * 刷新设置面板
+	 * 当语言设置变化时重新绘制设置界面，更新所有文本为当前语言
+	 */
 	refreshSettingsPane() {
+		// 检查设置面板是否已加载并可见
 		if (this.settingTab && this.settingTab.containerEl.parentElement) {
+			// 重新绘制设置面板UI
 			this.settingTab.display();
 		}
 	}
 
-	// 处理文件打开事件
+	/**
+	 * 处理文件打开事件
+	 * 当用户打开一个Markdown文件时，检查并添加缺失的时间戳
+	 * 只为没有时间戳的文件添加，不会修改已有的时间戳
+	 * 
+	 * @param file 打开的文件对象
+	 */
 	async handleFileOpen(file: TFile) {
-		// 如果插件正在初始化或不是 Markdown 文件，则退出
+		// 如果插件正在初始化或文件不是Markdown文件，则不处理
 		if (this.isInitializing || !file || file.extension !== 'md') return;
 
+		// 更新当前活动文件引用
 		this.activeFile = file;
 
 		try {
+			// 设置处理标志，防止触发新的modify事件
 			this.processingFile = true;
+			
+			// 读取文件内容
 			const content = await this.app.vault.read(file);
-			let dataToAdd: Record<string, string> = {};
+			const dataToAdd: Record<string, string> = {};
 			let needsUpdate = false;
 
-			// 检查文件是否有创建时间，如果没有则添加
+			// 检查文件是否有创建时间，如果设置启用且文件没有创建时间，则添加
 			if (this.settings.enableCreatedTime && !this.hasTimeProperty(content, 'created')) {
-				// 获取文件的实际创建时间
+				// 使用文件的实际创建时间作为创建时间
 				dataToAdd.created = moment(file.stat.ctime).format("YYYY-MM-DD HH:mm:ss");
 				needsUpdate = true;
 			}
 
-			// 检查文件是否有修改时间，如果没有则添加
+			// 检查文件是否有修改时间，如果设置启用且文件没有修改时间，则添加
 			if (this.settings.enableModifiedTime && !this.hasTimeProperty(content, 'modified')) {
-				// 获取文件的实际修改时间
+				// 使用文件的实际修改时间作为修改时间
 				dataToAdd.modified = moment(file.stat.mtime).format("YYYY-MM-DD HH:mm:ss");
 				needsUpdate = true;
 			}
 
-			// 如果需要更新，一次性添加所有缺失的时间属性
+			// 如果需要添加时间戳，则更新文件内容
 			if (needsUpdate) {
 				const newContent = this.insertFrontMatter(content, dataToAdd);
 				await this.app.vault.modify(file, newContent);
 			}
 		} catch (error) {
+			// 记录错误，但不中断插件运行
 			console.error("处理文件打开事件时出错:", error);
 		} finally {
+			// 重置处理标志，允许后续处理
 			this.processingFile = false;
 		}
 	}
 
-	// 检查文件内容是否包含指定的时间属性
+	/**
+	 * 检查文件内容是否包含指定的时间属性
+	 * 用于判断文件是否已经有了特定的时间戳（如created或modified）
+	 * 
+	 * @param content 文件内容
+	 * @param property 要检查的属性名称
+	 * @returns 如果文件包含指定属性则返回true，否则返回false
+	 */
 	hasTimeProperty(content: string, property: string): boolean {
+		// 匹配YAML frontmatter部分（---之间的内容）
 		const frontMatterRegex = /^---\n([\s\S]*?)\n---/;
 		const frontMatter = content.match(frontMatterRegex)?.[1] || '';
+		
+		// 创建正则表达式来查找指定属性
 		const propertyRegex = new RegExp(`^${property}:.*$`, 'm');
+		
+		// 测试frontmatter是否包含该属性
 		return propertyRegex.test(frontMatter);
 	}
 
-	// 处理文件创建事件
+	/**
+	 * 处理文件创建事件
+	 * 当创建新文件时，自动添加创建时间和修改时间
+	 * @param file 创建的文件
+	 */
 	async handleFileCreate(file: TFile) {
 		// 如果插件正在初始化或不是 Markdown 文件，则退出
 		if (this.isInitializing || file.extension !== 'md') return;
@@ -171,7 +225,7 @@ export default class AutoTimestampsPlugin extends Plugin {
 				const newContent = this.insertFrontMatter(content, data);
 				await this.app.vault.modify(file, newContent);
 
-				// 如果是当前活动文件，重置最后修改时间
+				// 如果是当前活动文件，重置最后修改时间，确保首次编辑会立即更新
 				if (file === this.activeFile && this.settings.enableModifiedTime) {
 					this.lastModifiedTime = 0;
 				}
@@ -183,7 +237,11 @@ export default class AutoTimestampsPlugin extends Plugin {
 		}
 	}
 
-	// 处理文件修改事件
+	/**
+	 * 处理文件修改事件
+	 * 当文件内容变化时，根据设置的时间间隔更新修改时间
+	 * @param file 修改的文件
+	 */
 	async handleFileModify(file: TFile) {
 		// 如果插件正在初始化、正在处理文件、不是活动文件或不是 Markdown 文件，则退出
 		if (this.isInitializing || this.processingFile || file.extension !== 'md' || file !== this.activeFile) return;
@@ -208,7 +266,12 @@ export default class AutoTimestampsPlugin extends Plugin {
 		}
 	}
 
-	// 在文档中插入或更新 frontmatter
+	/**
+	 * 在文档中插入或更新 frontmatter
+	 * @param content 原始文件内容
+	 * @param data 要插入的数据
+	 * @returns 更新后的文件内容
+	 */
 	insertFrontMatter(content: string, data: Record<string, string>): string {
 		const frontMatterRegex = /^---\n([\s\S]*?)\n---/;
 		let frontMatter = content.match(frontMatterRegex)?.[1] || '';
@@ -233,26 +296,35 @@ export default class AutoTimestampsPlugin extends Plugin {
 		}
 	}
 
-	// 插件卸载时的清理工作
+	/**
+	 * 插件卸载时的清理工作
+	 */
 	onunload() {
 		console.log('卸载时间戳插件');
 	}
 
-	// 加载插件设置
+	/**
+	 * 加载插件设置
+	 */
 	async loadSettings() {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
 	}
 
-	// 保存插件设置
+	/**
+	 * 保存插件设置
+	 */
 	async saveSettings() {
 		await this.saveData(this.settings);
 	}
 
-	// 更新插件描述
+	/**
+	 * 更新插件描述
+	 * 根据当前语言设置更新插件在设置面板中的描述
+	 */
 	updatePluginDescription() {
 		try {
 			// 获取本地化描述
-			const localizedDescription = getLocal().pluginDescription;
+			const localizedDescription = messages.pluginDescription;
 
 			// 更新插件清单中的描述
 			if (this.manifest) {
@@ -287,7 +359,10 @@ export default class AutoTimestampsPlugin extends Plugin {
 	}
 }
 
-// 设置面板类
+/**
+ * 设置面板类
+ * 用于提供插件设置界面
+ */
 class AutoTimestampsSettingTab extends PluginSettingTab {
 	plugin: AutoTimestampsPlugin;
 
@@ -296,16 +371,21 @@ class AutoTimestampsSettingTab extends PluginSettingTab {
 		this.plugin = plugin;
 	}
 
+	/**
+	 * 显示设置面板
+	 * 创建UI元素并绑定事件
+	 */
 	display(): void {
 		const {containerEl} = this;
 		containerEl.empty();
-
-		containerEl.createEl('h2', {text: getLocal().settingsTitle});
+		
+		// 创建标题
+		containerEl.createEl('h2', {text: messages.settingsTitle});
 
 		// 创建时间设置
 		new Setting(containerEl)
-			.setName(getLocal().enableCreatedTimeName)
-			.setDesc(getLocal().enableCreatedTimeDesc)
+			.setName(messages.enableCreatedTimeName)
+			.setDesc(messages.enableCreatedTimeDesc)
 			.addToggle(toggle => toggle
 				.setValue(this.plugin.settings.enableCreatedTime)
 				.onChange(async (value) => {
@@ -315,8 +395,8 @@ class AutoTimestampsSettingTab extends PluginSettingTab {
 
 		// 修改时间设置
 		new Setting(containerEl)
-			.setName(getLocal().enableModifiedTimeName)
-			.setDesc(getLocal().enableModifiedTimeDesc)
+			.setName(messages.enableModifiedTimeName)
+			.setDesc(messages.enableModifiedTimeDesc)
 			.addToggle(toggle => toggle
 				.setValue(this.plugin.settings.enableModifiedTime)
 				.onChange(async (value) => {
@@ -326,8 +406,8 @@ class AutoTimestampsSettingTab extends PluginSettingTab {
 
 		// 时间间隔设置
 		new Setting(containerEl)
-			.setName(getLocal().enableModifiedTimeName)
-			.setDesc(getLocal().enableModifiedTimeDesc)
+			.setName(messages.modifyIntervalName)
+			.setDesc(messages.modifyIntervalDesc)
 			.addText(text => text
 				.setValue(this.plugin.settings.modifyInterval.toString())
 				.onChange(async (value) => {
