@@ -29,6 +29,44 @@
 
 import { App, Plugin, PluginSettingTab, Setting, TFile, moment } from 'obsidian';
 
+// 添加i18n本地化接口
+interface Translations {
+    [key: string]: {
+        settingsTitle: string;
+        enableCreatedTimeName: string;
+        enableCreatedTimeDesc: string;
+        enableModifiedTimeName: string;
+        enableModifiedTimeDesc: string;
+        modifyIntervalName: string;
+        modifyIntervalDesc: string;
+        pluginDescription: string;
+    };
+}
+
+// 翻译数据
+const translations: Translations = {
+    'zh': {
+        settingsTitle: '时间戳插件设置',
+        enableCreatedTimeName: '启用创建时间',
+        enableCreatedTimeDesc: '开启或关闭为文档添加创建时间',
+        enableModifiedTimeName: '启用修改时间',
+        enableModifiedTimeDesc: '开启或关闭为修改的文档添加更新时间',
+        modifyIntervalName: '修改时间间隔（秒）',
+        modifyIntervalDesc: '设置忽略最后一次修改后的时间间隔（秒）',
+        pluginDescription: '自动为文档添加创建时间和修改时间的时间戳'
+    },
+    'en': {
+        settingsTitle: 'Auto Timestamps Settings',
+        enableCreatedTimeName: 'Enable Created Time',
+        enableCreatedTimeDesc: 'Toggle adding creation time to documents',
+        enableModifiedTimeName: 'Enable Modified Time',
+        enableModifiedTimeDesc: 'Toggle adding modification time to updated documents',
+        modifyIntervalName: 'Modification Interval (seconds)',
+        modifyIntervalDesc: 'Set the interval (in seconds) to ignore updates after the last modification',
+        pluginDescription: 'An Obsidian plugin to automatically add creation and modification timestamps to documents'
+    }
+};
+
 // 插件设置接口
 interface AutoTimestampsPluginSettings {
     enableCreatedTime: boolean;    // 是否启用创建时间
@@ -49,13 +87,33 @@ export default class AutoTimestampsPlugin extends Plugin {
     private activeFile: TFile | null = null;  // 追踪当前活动文件
     private processingFile: boolean = false;  // 防止事件循环的标志
     private isInitializing: boolean = true;   // 标记插件是否正在初始化
+    private locale: string = 'en';  // 默认语言
+    private settingTab: AutoTimestampsSettingTab;
 
     async onload() {
         // 加载插件设置
         await this.loadSettings();
 
+        // 检测Obsidian界面语言
+        this.detectLocale();
+
         // 添加设置选项卡
-        this.addSettingTab(new AutoTimestampsSettingTab(this.app, this));
+        this.settingTab = new AutoTimestampsSettingTab(this.app, this);
+        this.addSettingTab(this.settingTab);
+
+        // 更新插件描述
+        this.updatePluginDescription();
+
+        // 监听Obsidian的本地化变化
+        this.app.workspace.onLayoutReady(() => {
+            this.registerEvent(
+                (this.app.workspace as any).on('change:locale', () => {
+                    this.detectLocale();
+                    this.refreshSettingsPane();
+                    this.updatePluginDescription();
+                })
+            );
+        });
 
         // 初始化阶段不处理任何文件
         setTimeout(() => {
@@ -74,6 +132,44 @@ export default class AutoTimestampsPlugin extends Plugin {
         this.registerEvent(
             this.app.vault.on('modify', this.handleFileModify.bind(this))
         );
+    }
+
+    // 刷新设置面板
+    refreshSettingsPane() {
+        if (this.settingTab && this.settingTab.containerEl.parentElement) {
+            this.settingTab.display();
+        }
+    }
+
+    // 检测Obsidian界面语言
+    detectLocale() {
+        try {
+            // 尝试多种方式获取Obsidian的语言设置
+            const momentLocale = moment.locale();
+            const vaultLang = (this.app.vault as any).config?.lang;
+            const appLocale = (this.app as any).locale;
+            
+            // 使用moment.locale作为首选检测方法
+            let detectedLocale = momentLocale || vaultLang || appLocale || 'en';
+            
+            // 检查是否为中文
+            if (detectedLocale.startsWith('zh')) {
+                this.locale = 'zh';
+            } else {
+                this.locale = 'en';
+            }
+            
+            return this.locale;
+        } catch (error) {
+            console.error("检测语言时出错:", error);
+            this.locale = 'en'; // 出错时默认使用英文
+            return 'en';
+        }
+    }
+
+    // 获取当前语言的翻译
+    t(key: keyof Translations['en']) {
+        return translations[this.locale][key];
     }
 
     // 处理文件打开事件
@@ -224,6 +320,44 @@ export default class AutoTimestampsPlugin extends Plugin {
     async saveSettings() {
         await this.saveData(this.settings);
     }
+
+    // 更新插件描述
+    updatePluginDescription() {
+        try {
+            // 获取本地化描述
+            const localizedDescription = this.t('pluginDescription');
+            
+            // 更新插件清单中的描述
+            if (this.manifest) {
+                this.manifest.description = localizedDescription;
+            }
+            
+            // 尝试直接修改DOM
+            setTimeout(() => {
+                try {
+                    // 查找插件设置面板中的描述元素
+                    const pluginElements = document.querySelectorAll('.community-plugin-item');
+                    
+                    for (let i = 0; i < pluginElements.length; i++) {
+                        const element = pluginElements[i] as HTMLElement;
+                        const idElement = element.querySelector('.community-plugin-name');
+                        
+                        if (idElement && idElement.textContent && idElement.textContent.includes('Auto Timestamps')) {
+                            // 找到描述元素
+                            const descElement = element.querySelector('.community-plugin-desc');
+                            if (descElement) {
+                                descElement.textContent = localizedDescription;
+                            }
+                        }
+                    }
+                } catch (error) {
+                    // 忽略错误
+                }
+            }, 100);
+        } catch (error) {
+            console.error("更新插件描述时出错:", error);
+        }
+    }
 }
 
 // 设置面板类
@@ -239,12 +373,12 @@ class AutoTimestampsSettingTab extends PluginSettingTab {
         const { containerEl } = this;
         containerEl.empty();
 
-        containerEl.createEl('h2', { text: '时间戳插件设置' });
+        containerEl.createEl('h2', { text: this.plugin.t('settingsTitle') });
 
         // 创建时间设置
         new Setting(containerEl)
-            .setName('启用创建时间')
-            .setDesc('开启或关闭为文档添加创建时间')
+            .setName(this.plugin.t('enableCreatedTimeName'))
+            .setDesc(this.plugin.t('enableCreatedTimeDesc'))
             .addToggle(toggle => toggle
                 .setValue(this.plugin.settings.enableCreatedTime)
                 .onChange(async (value) => {
@@ -254,8 +388,8 @@ class AutoTimestampsSettingTab extends PluginSettingTab {
 
         // 修改时间设置
         new Setting(containerEl)
-            .setName('启用修改时间')
-            .setDesc('开启或关闭为修改的文档添加更新时间')
+            .setName(this.plugin.t('enableModifiedTimeName'))
+            .setDesc(this.plugin.t('enableModifiedTimeDesc'))
             .addToggle(toggle => toggle
                 .setValue(this.plugin.settings.enableModifiedTime)
                 .onChange(async (value) => {
@@ -265,8 +399,8 @@ class AutoTimestampsSettingTab extends PluginSettingTab {
 
         // 时间间隔设置
         new Setting(containerEl)
-            .setName('修改时间间隔（秒）')
-            .setDesc('设置忽略最后一次修改后的时间间隔（秒）')
+            .setName(this.plugin.t('modifyIntervalName'))
+            .setDesc(this.plugin.t('modifyIntervalDesc'))
             .addText(text => text
                 .setValue(this.plugin.settings.modifyInterval.toString())
                 .onChange(async (value) => {
